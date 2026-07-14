@@ -1,56 +1,12 @@
 """
-VOC 대시보드 - 채널톡 상담 관리
-비개발자를 위한 Streamlit 기반 대시보드
-(이슈 모음 탭 포함 v1.2)
+VOC 대시보드 v2.0 - 엑셀 업로드 방식
+채널톡 내보내기 파일을 업로드하면 자동 분석
+API 키 불필요!
 """
 
-import os
-import time
 import datetime
-import requests
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-
-# ─────────────────────────────────────────────
-# 환경변수 로드
-# ─────────────────────────────────────────────
-load_dotenv()
-
-CHANNEL_ACCESS_KEY = os.getenv("CHANNEL_ACCESS_KEY", "")
-CHANNEL_ACCESS_SECRET = os.getenv("CHANNEL_ACCESS_SECRET", "")
-CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
-CLAUDE_API_BASE = os.getenv("CLAUDE_API_BASE", "https://api.anthropic.com")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
-
-# Streamlit Cloud Secrets 지원
-if not CHANNEL_ACCESS_KEY and hasattr(st, "secrets"):
-    CHANNEL_ACCESS_KEY = st.secrets.get("CHANNEL_ACCESS_KEY", "")
-    CHANNEL_ACCESS_SECRET = st.secrets.get("CHANNEL_ACCESS_SECRET", "")
-    CLAUDE_API_KEY = st.secrets.get("CLAUDE_API_KEY", "")
-    CLAUDE_API_BASE = st.secrets.get("CLAUDE_API_BASE", "https://api.anthropic.com")
-    CLAUDE_MODEL = st.secrets.get("CLAUDE_MODEL", "claude-haiku-4-5")
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-
-# AI 서비스 선택: Claude 우선 → Ollama → Gemini
-def detect_ai_service():
-    if CLAUDE_API_KEY:
-        return "claude"
-    try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=3)
-        if r.status_code == 200:
-            models = [m.get("name", "") for m in r.json().get("models", [])]
-            if models:
-                return "ollama"
-    except Exception:
-        pass
-    if GEMINI_API_KEY:
-        return "gemini"
-    return None
-
-AI_SERVICE = detect_ai_service()
 
 # ─────────────────────────────────────────────
 # 페이지 설정
@@ -75,15 +31,18 @@ st.markdown("""
     }
     .stat-card .number { font-size: 2rem; font-weight: 700; color: #1a1a2e; }
     .stat-card .label { font-size: 0.85rem; color: #888; margin-top: 0.3rem; }
+    .cx-low {
+        background: #FFF3F0; border: 1px solid #FFB4A2;
+        border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem;
+    }
+    .cx-high {
+        background: #F0FFF4; border: 1px solid #A2D2B4;
+        border-radius: 8px; padding: 0.8rem 1rem; margin-bottom: 0.5rem;
+    }
     .ai-tag {
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
         color: white; padding: 2px 8px; border-radius: 12px;
         font-size: 0.7rem; font-weight: 600; margin-left: 4px;
-    }
-    .tag-chip {
-        display: inline-block; background: #E8F0FE; color: #1967D2;
-        padding: 2px 10px; border-radius: 12px; font-size: 0.75rem;
-        margin: 1px 2px; font-weight: 500;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -91,446 +50,181 @@ st.markdown("""
 st.markdown("""
 <div class="main-header">
     <h1>📋 VOC 대시보드</h1>
-    <p>채널톡 상담 데이터 조회 & AI 요약</p>
+    <p>채널톡 엑셀 업로드 → 자동 분석 (API 키 불필요)</p>
 </div>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────
-# 채널톡 API 함수들
-# ─────────────────────────────────────────────
-CHANNEL_API_BASE = "https://api.channel.io/open/v5"
-
-def get_channel_headers():
-    return {
-        "x-access-key": CHANNEL_ACCESS_KEY,
-        "x-access-secret": CHANNEL_ACCESS_SECRET,
-        "Content-Type": "application/json",
-    }
-
-def fetch_user_chats(state="closed", limit=50):
-    all_chats = []
-    url = f"{CHANNEL_API_BASE}/user-chats"
-    params = {"state": state, "limit": limit, "sortOrder": "desc"}
-    while True:
-        try:
-            resp = requests.get(url, headers=get_channel_headers(), params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.RequestException as e:
-            st.error(f"채널톡 API 호출 실패: {e}")
-            break
-        chats = data.get("userChats", [])
-        all_chats.extend(chats)
-        next_cursor = data.get("next")
-        if not next_cursor or len(chats) == 0:
-            break
-        params["since"] = next_cursor
-        time.sleep(0.3)
-    return all_chats
-
-def fetch_messages(user_chat_id, limit=50):
-    url = f"{CHANNEL_API_BASE}/user-chats/{user_chat_id}/messages"
-    params = {"limit": limit, "sortOrder": "asc"}
-    try:
-        resp = requests.get(url, headers=get_channel_headers(), params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json().get("messages", [])
-    except requests.exceptions.RequestException as e:
-        st.warning(f"메시지 조회 실패 (chat: {user_chat_id}): {e}")
-        return []
-
-def get_user_info(user_id):
-    url = f"{CHANNEL_API_BASE}/users/{user_id}"
-    try:
-        resp = requests.get(url, headers=get_channel_headers(), timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("user", {})
-    except Exception:
-        return {}
-
-
-# ─────────────────────────────────────────────
-# AI 요약 함수
-# ─────────────────────────────────────────────
-SUMMARY_PROMPT = """아래는 고객 상담 대화임. 핵심만 음슴체로 15자 이내 초간결 요약해.
-
-규칙:
-- 반드시 15자 이내
-- 음슴체 사용 (예: ~문의함, ~요청함, ~확인 요청함, ~안내받음)
-- 부가 설명 없이 핵심 키워드 + 동사만
-- 한 문장만 출력
-
-좋은 예시:
-- 코스 접근 권한 문의함
-- 환불 처리 요청함
-- 수강료 결제 오류 문의함
-- USB 마이크 사용 가능 여부 문의함
-- 수료증 발급 요청함
-
-대화 내용:
-{text}"""
-
-
-def summarize_with_claude(conversation_text):
-    try:
-        if "anthropic.com" not in CLAUDE_API_BASE:
-            resp = requests.post(
-                f"{CLAUDE_API_BASE}/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {CLAUDE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": CLAUDE_MODEL,
-                    "max_tokens": 60,
-                    "messages": [{"role": "user", "content": SUMMARY_PROMPT.format(text=conversation_text[:3000])}]
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            result = resp.json()["choices"][0]["message"]["content"].strip()
-        else:
-            resp = requests.post(
-                f"{CLAUDE_API_BASE}/v1/messages",
-                headers={
-                    "x-api-key": CLAUDE_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": CLAUDE_MODEL,
-                    "max_tokens": 60,
-                    "messages": [{"role": "user", "content": SUMMARY_PROMPT.format(text=conversation_text[:3000])}]
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            result = resp.json()["content"][0]["text"].strip()
-        return result.split("\n")[0].strip().strip('"').strip("'").strip("-").strip("• ").strip()
-    except Exception as e:
-        return f"요약 실패: {e}"
-
-
-def summarize_with_ollama(conversation_text):
-    try:
-        resp = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": SUMMARY_PROMPT.format(text=conversation_text[:3000]),
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 50}
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        result = resp.json().get("response", "").strip()
-        return result.split("\n")[0].strip().strip('"').strip("'").strip("-").strip("• ").strip()
-    except Exception as e:
-        return f"요약 실패: {e}"
-
-
-def summarize_with_gemini(conversation_text):
-    try:
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={"contents": [{"parts": [{"text": SUMMARY_PROMPT.format(text=conversation_text[:3000])}]}]},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        result = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        return result.split("\n")[0].strip().strip('"').strip("'").strip("-").strip("• ").strip()
-    except Exception as e:
-        return f"요약 실패: {e}"
-
-
-def summarize_conversation(conversation_text):
-    if AI_SERVICE == "claude":
-        return summarize_with_claude(conversation_text)
-    elif AI_SERVICE == "ollama":
-        return summarize_with_ollama(conversation_text)
-    elif AI_SERVICE == "gemini":
-        return summarize_with_gemini(conversation_text)
-    else:
-        return "(AI가 연결되지 않음)"
-
-
-def messages_to_text(messages):
-    lines = []
-    for msg in messages:
-        person_type = msg.get("personType", "")
-        role = "고객" if person_type == "user" else "매니저"
-        text = msg.get("plainText", "")
-        if text and text.strip():
-            lines.append(f"[{role}] {text.strip()}")
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────
 # 인입 경로 매핑
 # ─────────────────────────────────────────────
-CHANNEL_MAP = {
-    "CHANNEL_TALK": "채널톡",
-    "channel": "채널톡",
-    "KAKAOTALK": "카카오톡",
+MEDIUM_MAP = {
+    "native": "채널톡",
+    "app": "앱",
     "kakao": "카카오톡",
-    "PHONE": "전화",
     "phone": "전화",
-    "MEET": "전화",
-    "meet": "전화",
+    "email": "이메일",
+    "sms": "SMS",
 }
 
-def get_channel_name(chat):
-    medium = chat.get("contactMediumType", "")
-    if isinstance(medium, str) and medium in CHANNEL_MAP:
-        return CHANNEL_MAP[medium]
-    source = chat.get("source", "")
-    if isinstance(source, str) and source in CHANNEL_MAP:
-        return CHANNEL_MAP[source]
-    front_id = str(chat.get("frontMessageId", ""))
-    if "kakao" in front_id.lower():
-        return "카카오톡"
-    if isinstance(medium, str) and medium:
-        return medium
-    return "채널톡"
 
+def parse_uploaded_file(uploaded_file):
+    """업로드된 엑셀/CSV 파일을 파싱하여 정제된 DataFrame 반환"""
+    if uploaded_file.name.endswith(".csv"):
+        raw = pd.read_csv(uploaded_file)
+    else:
+        raw = pd.read_excel(uploaded_file)
 
-def get_tags(chat):
-    """상담의 태그 목록을 가져오기"""
-    tags = chat.get("tags", [])
-    if isinstance(tags, list):
-        return [str(t) for t in tags if t]
-    return []
+    rows = []
+    all_tags = set()
+
+    for _, r in raw.iterrows():
+        # 고객명
+        name = str(r.get("name", "알 수 없음")) if pd.notna(r.get("name")) else "알 수 없음"
+
+        # 인입 시간
+        managed = r.get("managedAt", r.get("createdAt", ""))
+        if pd.notna(managed):
+            try:
+                dt = pd.to_datetime(managed)
+                time_str = dt.strftime("%y/%m/%d %H:%M")
+            except Exception:
+                time_str = str(managed)
+        else:
+            time_str = "-"
+
+        # AI 요약 (채널톡 자체 요약)
+        summary = ""
+        if pd.notna(r.get("summarizedMessage")):
+            # 첫 줄만 가져오고 50자 제한
+            first_line = str(r["summarizedMessage"]).split("\n")[0].strip()
+            summary = first_line[:50]
+        else:
+            summary = "(요약 없음)"
+
+        # 인입 경로
+        medium = str(r.get("mediumType", "")) if pd.notna(r.get("mediumType")) else ""
+        channel = MEDIUM_MAP.get(medium, medium if medium else "기타")
+
+        # 태그
+        tags_raw = str(r.get("tags", "")) if pd.notna(r.get("tags")) else ""
+        tag_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
+        all_tags.update(tag_list)
+        tags_str = ", ".join(tag_list) if tag_list else "-"
+
+        # CX 만족도
+        cx = r.get("cxScore", None)
+        cx_score = float(cx) if pd.notna(cx) else None
+
+        # 상태
+        state = str(r.get("state", "")) if pd.notna(r.get("state")) else ""
+        state_map = {"closed": "종료", "opened": "진행 중", "snoozed": "보류", "initial": "초기"}
+        state_kr = state_map.get(state, state)
+
+        # 방향
+        direction = str(r.get("direction", "")) if pd.notna(r.get("direction")) else ""
+
+        rows.append({
+            "고객명": name,
+            "인입 시간": time_str,
+            "핵심 요약": summary,
+            "인입 경로": channel,
+            "태그": tags_str,
+            "CX 점수": cx_score,
+            "상태": state_kr,
+            "_datetime": pd.to_datetime(managed) if pd.notna(managed) else None,
+            "_tags_list": tag_list,
+            "_full_summary": str(r.get("summarizedMessage", "")) if pd.notna(r.get("summarizedMessage")) else "",
+        })
+
+    df = pd.DataFrame(rows)
+    return df, list(all_tags)
 
 
 # ─────────────────────────────────────────────
-# 사이드바
+# 사이드바: 파일 업로드 & 필터
 # ─────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ 조회 설정")
+    st.markdown("### 📂 파일 업로드")
     st.markdown("---")
-    st.markdown("**API 연결 상태**")
 
-    if CHANNEL_ACCESS_KEY and CHANNEL_ACCESS_SECRET:
-        st.success("✅ 채널톡 API 연결됨")
-    else:
-        st.error("❌ 채널톡 API 키 없음")
-
-    if AI_SERVICE == "claude":
-        st.success("✅ Claude AI 연결됨")
-    elif AI_SERVICE == "ollama":
-        st.success(f"✅ 로컬 AI 연결됨 ({OLLAMA_MODEL})")
-    elif AI_SERVICE == "gemini":
-        st.success("✅ Gemini AI 연결됨")
-    else:
-        st.warning("⚠️ AI 없음")
-
-    st.markdown("---")
-    st.markdown("**📅 조회 기간**")
-    today = datetime.date.today()
-    week_ago = today - datetime.timedelta(days=7)
-
-    col_start, col_end = st.columns(2)
-    with col_start:
-        start_date = st.date_input("시작일", value=week_ago)
-    with col_end:
-        end_date = st.date_input("종료일", value=today)
-
-    if start_date > end_date:
-        st.error("시작일이 종료일보다 뒤에 있습니다!")
-
-    st.markdown("---")
-    chat_state = st.selectbox(
-        "상담 상태",
-        options=["closed", "opened", "snoozed"],
-        format_func=lambda x: {"closed": "종료됨", "opened": "진행 중", "snoozed": "보류 중"}[x],
-        index=0,
+    uploaded_file = st.file_uploader(
+        "채널톡 내보내기 파일 (xlsx/csv)",
+        type=["xlsx", "xls", "csv"],
+        help="채널톡 → 상담 목록 → 내보내기 → 다운로드한 파일을 여기에 올려주세요",
     )
 
-    st.markdown("---")
+    if uploaded_file:
+        st.success(f"✅ {uploaded_file.name}")
 
-    # 태그 필터 (데이터 조회 후 표시)
-    if "all_tags" in st.session_state and st.session_state.all_tags:
+        # 데이터 파싱 (캐싱)
+        if "uploaded_name" not in st.session_state or st.session_state.uploaded_name != uploaded_file.name:
+            df, all_tags = parse_uploaded_file(uploaded_file)
+            st.session_state.df = df
+            st.session_state.all_tags = all_tags
+            st.session_state.uploaded_name = uploaded_file.name
+
+        st.markdown("---")
         st.markdown("**🏷️ 태그 필터**")
-        tag_options = ["전체"] + sorted(st.session_state.all_tags)
-        selected_tags = st.multiselect(
-            "태그 선택 (복수 가능)",
-            options=tag_options,
-            default=["전체"],
+        if st.session_state.all_tags:
+            tag_options = ["전체"] + sorted(st.session_state.all_tags)
+            selected_tags = st.multiselect(
+                "태그 선택",
+                options=tag_options,
+                default=["전체"],
+            )
+        else:
+            selected_tags = ["전체"]
+
+        st.markdown("---")
+        st.markdown("**📊 CX 점수 필터**")
+        cx_filter = st.select_slider(
+            "최대 CX 점수",
+            options=["전체", "1.0", "2.0", "3.0", "4.0", "5.0"],
+            value="전체",
         )
     else:
         selected_tags = ["전체"]
-
-    st.markdown("---")
-    fetch_btn = st.button("🔍 데이터 조회하기", use_container_width=True, type="primary")
+        cx_filter = "전체"
 
 
 # ─────────────────────────────────────────────
-# 메인: 데이터 조회
+# 메인 영역
 # ─────────────────────────────────────────────
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "raw_chats" not in st.session_state:
-    st.session_state.raw_chats = []
-if "all_tags" not in st.session_state:
-    st.session_state.all_tags = []
-
-if fetch_btn:
-    if not CHANNEL_ACCESS_KEY or not CHANNEL_ACCESS_SECRET:
-        st.error("⚠️ `.env` 파일에 채널톡 API 키를 먼저 입력해주세요!")
-    else:
-        with st.spinner("채널톡에서 데이터를 불러오는 중..."):
-            chats = fetch_user_chats(state=chat_state)
-            if not chats:
-                st.warning("조회된 상담이 없습니다.")
-            else:
-                start_ts = int(datetime.datetime.combine(start_date, datetime.time.min).timestamp() * 1000)
-                end_ts = int(datetime.datetime.combine(end_date, datetime.time.max).timestamp() * 1000)
-
-                filtered = []
-                all_tags_set = set()
-
-                for chat in chats:
-                    created = chat.get("createdAt", 0)
-                    if created < start_ts or created > end_ts:
-                        continue
-                    channel = get_channel_name(chat)
-                    if channel not in ["채널톡", "카카오톡"]:
-                        continue
-                    # 태그 수집
-                    tags = get_tags(chat)
-                    all_tags_set.update(tags)
-                    filtered.append(chat)
-
-                st.session_state.all_tags = list(all_tags_set)
-
-                if not filtered:
-                    st.warning("선택한 조건에 맞는 상담이 없습니다.")
-                else:
-                    rows = []
-                    progress = st.progress(0, text="고객 정보 조회 중...")
-                    for i, chat in enumerate(filtered):
-                        progress.progress((i + 1) / len(filtered), text=f"상담 정보 조회 중... ({i+1}/{len(filtered)})")
-                        user_id = chat.get("userId", "")
-                        customer_name = chat.get("name", "")
-                        if not customer_name and user_id:
-                            user_info = get_user_info(user_id)
-                            customer_name = (
-                                user_info.get("profile", {}).get("name", "")
-                                or user_info.get("name", "")
-                                or "알 수 없음"
-                            )
-                        created_at = chat.get("createdAt", 0)
-                        if created_at:
-                            dt = datetime.datetime.fromtimestamp(created_at / 1000)
-                            time_str = dt.strftime("%y/%m/%d %H:%M")
-                        else:
-                            time_str = "-"
-
-                        tags = get_tags(chat)
-                        tags_str = ", ".join(tags) if tags else "-"
-
-                        rows.append({
-                            "chat_id": chat.get("id", ""),
-                            "고객명": customer_name or "알 수 없음",
-                            "최근 인입 시간": time_str,
-                            "핵심 요약": "",
-                            "인입 경로": get_channel_name(chat),
-                            "태그": tags_str,
-                        })
-                        time.sleep(0.1)
-                    progress.empty()
-                    df = pd.DataFrame(rows)
-                    st.session_state.df = df
-                    st.session_state.raw_chats = filtered
-                    st.success(f"✅ 총 {len(df)}건의 상담을 불러왔습니다!")
-                    st.rerun()
-
-
-# ─────────────────────────────────────────────
-# 데이터 표시
-# ─────────────────────────────────────────────
-if st.session_state.df is not None and len(st.session_state.df) > 0:
-    df = st.session_state.df
+if "df" in st.session_state and st.session_state.df is not None and len(st.session_state.df) > 0:
+    df = st.session_state.df.copy()
 
     # 태그 필터 적용
     if "전체" not in selected_tags and selected_tags:
-        mask = df["태그"].apply(
-            lambda x: any(tag in x for tag in selected_tags)
-        )
+        mask = df["태그"].apply(lambda x: any(tag in x for tag in selected_tags))
         df = df[mask]
 
-    col1, col2, col3, col4 = st.columns(4)
+    # CX 점수 필터 적용
+    if cx_filter != "전체":
+        cx_val = float(cx_filter)
+        df = df[df["CX 점수"].fillna(99) <= cx_val]
+
+    # ─── 통계 카드 ───
     total = len(df)
-    ch_count = len(df[df["인입 경로"] == "채널톡"])
-    kakao_count = len(df[df["인입 경로"] == "카카오톡"])
+    cx_scores = df["CX 점수"].dropna()
+    avg_cx = cx_scores.mean() if len(cx_scores) > 0 else 0
+    low_cx = (cx_scores <= 3.0).sum() if len(cx_scores) > 0 else 0
     tag_count = len(st.session_state.all_tags)
 
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.markdown(f'<div class="stat-card"><div class="number">{total}</div><div class="label">전체 상담</div></div>', unsafe_allow_html=True)
     with col2:
-        st.markdown(f'<div class="stat-card"><div class="number">{ch_count}</div><div class="label">채널톡</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="stat-card"><div class="number">{avg_cx:.1f}</div><div class="label">평균 CX 점수</div></div>', unsafe_allow_html=True)
     with col3:
-        st.markdown(f'<div class="stat-card"><div class="number">{kakao_count}</div><div class="label">카카오톡</div></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="stat-card"><div class="number">{low_cx}</div><div class="label">CX 3.0 이하 ⚠️</div></div>', unsafe_allow_html=True)
     with col4:
         st.markdown(f'<div class="stat-card"><div class="number">{tag_count}</div><div class="label">태그 종류</div></div>', unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # AI 요약 버튼
-    if AI_SERVICE:
-        ai_labels = {"claude": "Claude", "ollama": f"로컬 AI ({OLLAMA_MODEL})", "gemini": "Gemini"}
-        ai_label = ai_labels.get(AI_SERVICE, AI_SERVICE)
-
-        summarize_btn = st.button(
-            f"🤖 AI 요약 생성 ({ai_label})",
-            use_container_width=True,
-            help="각 상담의 대화 내용을 AI가 자동으로 요약합니다.",
-        )
-        if summarize_btn:
-            chats = st.session_state.raw_chats
-            progress = st.progress(0, text="AI 요약 생성 중...")
-            success_count = 0
-            fail_count = 0
-
-            for i, chat in enumerate(chats):
-                progress.progress(
-                    (i + 1) / len(chats),
-                    text=f"AI 요약 생성 중... ({i+1}/{len(chats)}) ✅{success_count} ❌{fail_count}"
-                )
-                chat_id = chat.get("id", "")
-                messages = fetch_messages(chat_id)
-                if messages:
-                    conv_text = messages_to_text(messages)
-                    if conv_text.strip():
-                        summary = summarize_conversation(conv_text)
-                        st.session_state.df.at[i, "핵심 요약"] = summary
-                        if "요약 실패" in summary:
-                            fail_count += 1
-                        else:
-                            success_count += 1
-                    else:
-                        st.session_state.df.at[i, "핵심 요약"] = "(대화 내용 없음)"
-                else:
-                    st.session_state.df.at[i, "핵심 요약"] = "(메시지 조회 실패)"
-
-                if AI_SERVICE == "gemini":
-                    time.sleep(5)
-                elif AI_SERVICE == "claude":
-                    time.sleep(1)
-
-            progress.empty()
-            st.success(f"✅ AI 요약 완료! (성공: {success_count}건, 실패: {fail_count}건)")
-            df = st.session_state.df
-            # 태그 필터 다시 적용
-            if "전체" not in selected_tags and selected_tags:
-                mask = df["태그"].apply(lambda x: any(tag in x for tag in selected_tags))
-                df = df[mask]
-
-    # ─── 탭 구성: 상담 테이블 / 이슈 모음 ───
-    tab_table, tab_issues = st.tabs(["📋 상담 테이블", "🔥 이슈 모음"])
+    # ─── 탭 구성 ───
+    tab_table, tab_issues, tab_cx = st.tabs(["📋 상담 테이블", "🔥 이슈 모음", "📊 CX 분석"])
 
     # ── 탭 1: 상담 테이블 ──
     with tab_table:
@@ -538,65 +232,76 @@ if st.session_state.df is not None and len(st.session_state.df) > 0:
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
             <div>
                 <span style="font-size: 1.1rem; font-weight: 600;">📋 상담 테이블</span>
-                <span style="color: #888; font-size: 0.9rem; margin-left: 8px;">총 {len(df)}건의 상담</span>
+                <span style="color: #888; font-size: 0.9rem; margin-left: 8px;">총 {len(df)}건</span>
             </div>
-            <div><span style="font-size: 0.8rem; color: #888;">핵심 요약 <span class="ai-tag">AI</span></span></div>
         </div>
         """, unsafe_allow_html=True)
 
-        display_df = df[["고객명", "최근 인입 시간", "핵심 요약", "인입 경로", "태그"]].copy()
+        display_df = df[["고객명", "인입 시간", "핵심 요약", "인입 경로", "태그", "CX 점수", "상태"]].copy()
         st.dataframe(
             display_df,
             use_container_width=True,
             height=min(len(display_df) * 40 + 60, 600),
             column_config={
                 "고객명": st.column_config.TextColumn("고객명", width="small"),
-                "최근 인입 시간": st.column_config.TextColumn("최근 인입 시간", width="medium"),
-                "핵심 요약": st.column_config.TextColumn("핵심 요약 🤖", width="large"),
+                "인입 시간": st.column_config.TextColumn("인입 시간", width="medium"),
+                "핵심 요약": st.column_config.TextColumn("핵심 요약", width="large"),
                 "인입 경로": st.column_config.TextColumn("인입 경로", width="small"),
                 "태그": st.column_config.TextColumn("🏷️ 태그", width="medium"),
+                "CX 점수": st.column_config.NumberColumn("CX 점수", format="%.1f", width="small"),
+                "상태": st.column_config.TextColumn("상태", width="small"),
             },
             hide_index=True,
         )
 
         st.markdown("<br>", unsafe_allow_html=True)
         csv_data = display_df.to_csv(index=False, encoding="utf-8-sig")
-        date_label = f"{start_date.strftime('%y%m%d')}_{end_date.strftime('%y%m%d')}"
         st.download_button(
-            label="📥 엑셀(CSV) 다운로드",
+            label="📥 분석 결과 CSV 다운로드",
             data=csv_data,
-            file_name=f"VOC_상담내역_{date_label}.csv",
+            file_name=f"VOC_분석결과_{datetime.date.today().strftime('%y%m%d')}.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
     # ── 탭 2: 이슈 모음 ──
     with tab_issues:
-        ISSUE_CATEGORIES = {
-            "😡 불만": ["불만"],
-            "💡 개선": ["개선"],
-            "🐛 오류": ["오류"],
-        }
-
         st.markdown("""
         <div style="margin-bottom: 1rem;">
             <span style="font-size: 1.1rem; font-weight: 600;">🔥 이슈 모음</span>
-            <span style="color: #888; font-size: 0.9rem; margin-left: 8px;">불만 · 개선 · 오류 태그가 포함된 상담</span>
+            <span style="color: #888; font-size: 0.9rem; margin-left: 8px;">주의가 필요한 상담 모아보기</span>
         </div>
         """, unsafe_allow_html=True)
 
-        # 전체 데이터(필터 전)에서 이슈 태그 필터링
         full_df = st.session_state.df
+
+        # 이슈 카테고리 정의
+        ISSUE_CATEGORIES = {
+            "😡 불만": {"type": "tag", "keywords": ["불만"]},
+            "💡 개선": {"type": "tag", "keywords": ["개선"]},
+            "🐛 오류": {"type": "tag", "keywords": ["오류"]},
+            "⚠️ CX 점수 낮음 (3.0 이하)": {"type": "cx_low", "threshold": 3.0},
+        }
+
         issue_found = False
 
-        for category_label, tag_keywords in ISSUE_CATEGORIES.items():
-            # 해당 카테고리 태그가 포함된 행 필터링
-            category_mask = full_df["태그"].apply(
-                lambda x: any(kw in str(x) for kw in tag_keywords)
-            )
-            category_df = full_df[category_mask]
+        for category_label, config in ISSUE_CATEGORIES.items():
+            if config["type"] == "tag":
+                # 태그 기반 필터
+                category_mask = full_df["태그"].apply(
+                    lambda x: any(kw in str(x) for kw in config["keywords"])
+                )
+            elif config["type"] == "cx_low":
+                # CX 점수 기반 필터
+                category_mask = full_df["CX 점수"].apply(
+                    lambda x: x is not None and pd.notna(x) and float(x) <= config["threshold"]
+                )
+            else:
+                continue
 
+            category_df = full_df[category_mask]
             count = len(category_df)
+
             if count > 0:
                 issue_found = True
 
@@ -604,44 +309,128 @@ if st.session_state.df is not None and len(st.session_state.df) > 0:
                 if count == 0:
                     st.markdown(
                         "<div style='text-align: center; padding: 1rem; color: #aaa;'>"
-                        "해당 태그의 상담이 없습니다."
+                        "해당 항목이 없습니다."
                         "</div>",
                         unsafe_allow_html=True,
                     )
                 else:
-                    issue_display = category_df[["고객명", "최근 인입 시간", "핵심 요약", "인입 경로", "태그"]].copy()
+                    issue_display = category_df[["고객명", "인입 시간", "핵심 요약", "인입 경로", "태그", "CX 점수"]].copy()
                     st.dataframe(
                         issue_display,
                         use_container_width=True,
                         height=min(count * 40 + 60, 400),
                         column_config={
                             "고객명": st.column_config.TextColumn("고객명", width="small"),
-                            "최근 인입 시간": st.column_config.TextColumn("최근 인입 시간", width="medium"),
-                            "핵심 요약": st.column_config.TextColumn("핵심 요약 🤖", width="large"),
+                            "인입 시간": st.column_config.TextColumn("인입 시간", width="medium"),
+                            "핵심 요약": st.column_config.TextColumn("핵심 요약", width="large"),
                             "인입 경로": st.column_config.TextColumn("인입 경로", width="small"),
                             "태그": st.column_config.TextColumn("🏷️ 태그", width="medium"),
+                            "CX 점수": st.column_config.NumberColumn("CX 점수", format="%.1f", width="small"),
                         },
                         hide_index=True,
                     )
 
         if not issue_found:
-            st.info("현재 조회 기간에 불만/개선/오류 태그가 붙은 상담이 없습니다.")
+            st.info("이슈에 해당하는 상담이 없습니다.")
+
+    # ── 탭 3: CX 분석 ──
+    with tab_cx:
+        st.markdown("""
+        <div style="margin-bottom: 1rem;">
+            <span style="font-size: 1.1rem; font-weight: 600;">📊 CX 만족도 분석</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        cx_data = full_df[full_df["CX 점수"].notna()].copy()
+
+        if len(cx_data) > 0:
+            # CX 점수 분포
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                st.markdown("**점수 분포**")
+                cx_bins = cx_data["CX 점수"].value_counts().sort_index()
+                chart_data = pd.DataFrame({"CX 점수": cx_bins.index, "건수": cx_bins.values})
+                st.bar_chart(chart_data, x="CX 점수", y="건수")
+
+            with col_b:
+                st.markdown("**구간별 현황**")
+                ranges = [
+                    ("⭐ 5.0 (최고)", cx_data["CX 점수"] == 5.0),
+                    ("😊 4.0~4.9 (좋음)", (cx_data["CX 점수"] >= 4.0) & (cx_data["CX 점수"] < 5.0)),
+                    ("😐 3.1~3.9 (보통)", (cx_data["CX 점수"] > 3.0) & (cx_data["CX 점수"] < 4.0)),
+                    ("⚠️ 3.0 이하 (주의)", cx_data["CX 점수"] <= 3.0),
+                ]
+                for label, mask in ranges:
+                    cnt = mask.sum()
+                    pct = cnt / len(cx_data) * 100 if len(cx_data) > 0 else 0
+                    st.markdown(f"**{label}**: {cnt}건 ({pct:.0f}%)")
+
+            st.markdown("---")
+
+            # CX 점수 낮은 상담 상세
+            st.markdown("**⚠️ CX 점수 3.0 이하 상담 상세**")
+            low_cx_df = cx_data[cx_data["CX 점수"] <= 3.0].sort_values("CX 점수")
+
+            if len(low_cx_df) > 0:
+                for _, row in low_cx_df.iterrows():
+                    score = row["CX 점수"]
+                    emoji = "🔴" if score <= 2.0 else "🟡"
+                    st.markdown(
+                        f'<div class="cx-low">'
+                        f'<strong>{emoji} {row["고객명"]}</strong> '
+                        f'<span style="color: #E63946; font-weight: 600;">CX {score:.1f}</span> '
+                        f'<span style="color: #888; font-size: 0.85rem;">| {row["인입 시간"]} | {row["인입 경로"]}</span>'
+                        f'<br><span style="font-size: 0.9rem;">{row["핵심 요약"]}</span>'
+                        f'<br><span style="font-size: 0.8rem; color: #888;">태그: {row["태그"]}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.success("CX 3.0 이하 상담이 없습니다! 👍")
+        else:
+            st.info("CX 점수 데이터가 없습니다.")
+
+    # ─── 태그 분포 (하단) ───
+    st.markdown("---")
+    st.markdown("**🏷️ 태그 분포**")
+    tag_all = []
+    for tags_list in full_df["_tags_list"]:
+        tag_all.extend(tags_list)
+    if tag_all:
+        from collections import Counter
+        tag_counts = Counter(tag_all)
+        tag_chart = pd.DataFrame(
+            sorted(tag_counts.items(), key=lambda x: -x[1]),
+            columns=["태그", "건수"]
+        )
+        st.bar_chart(tag_chart, x="태그", y="건수")
 
 else:
     st.markdown("""
     <div style="text-align: center; padding: 4rem 2rem; color: #888;">
-        <div style="font-size: 3rem; margin-bottom: 1rem;">📋</div>
+        <div style="font-size: 3rem; margin-bottom: 1rem;">📂</div>
         <div style="font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem;">
-            좌측 사이드바에서 날짜를 선택하고<br>"데이터 조회하기" 버튼을 눌러주세요
+            좌측 사이드바에서 채널톡 엑셀 파일을 업로드해주세요
         </div>
-        <div style="font-size: 0.9rem;">채널톡 & 카카오톡 상담 내역을 조회합니다</div>
+        <div style="font-size: 0.9rem; margin-bottom: 1.5rem;">
+            채널톡 → 상담 목록 → 내보내기 → 다운로드한 .xlsx 또는 .csv 파일
+        </div>
+        <div style="background: #f0f0f0; border-radius: 8px; padding: 1rem; display: inline-block; text-align: left;">
+            <div style="font-size: 0.85rem; font-weight: 600; margin-bottom: 0.5rem;">💡 사용 방법</div>
+            <div style="font-size: 0.8rem; line-height: 1.8;">
+                1. 채널톡에서 상담 목록 엑셀 내보내기<br>
+                2. 좌측 사이드바에 파일 드래그 & 드롭<br>
+                3. 자동으로 분석 결과 표시!
+            </div>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #aaa; font-size: 0.8rem;'>"
-    "VOC 대시보드 v1.2 | Powered by Streamlit"
+    "VOC 대시보드 v2.0 | 엑셀 업로드 방식 | Powered by Streamlit"
     "</div>",
     unsafe_allow_html=True,
 )
